@@ -83,7 +83,7 @@ def window(d, x, y, width, height, slope, light=False):
     d.line((x + width // 2, y + rise // 2, x + width // 2, y + rise // 2 + height), fill="#8b5041" if light else "#423044")
 
 
-def building(name, walls, roof, width, height, apex, number):
+def building(name, walls, roof, width, height, apex, number, editable=False):
     img, d = canvas((72, 80))
     lit, glow = canvas(img.size)
     left, right, trim = walls
@@ -119,6 +119,7 @@ def building(name, walls, roof, width, height, apex, number):
         d.polygon([(x + 2, y + sy - 10), (x + 2 + dw, y + sy - 10 - dw // 2),
                    (x + 2 + dw, y + sy - dw // 2), (x + 2, y + sy)], fill="#231c28", outline="#ad7157")
         d.line((x + 3, y + sy - 2, x + 1 + dw, y + sy - dw // 2 - 1), fill="#db9a5d")
+    wall_shapes = ([w, wl, sl, s], [s, sl, el, e])
     a = (x - sx // 2, y - height - sy // 2 - apex)
     b = (x + sx // 2, y - height + sy // 2 - apex)
     wl = (wl[0] - 2, wl[1] + 1)
@@ -150,7 +151,7 @@ def building(name, walls, roof, width, height, apex, number):
         signal.rectangle((bx - 2, by - 23, bx + 2, by - 19), fill="#f7886a")
         signal.rectangle((bx - 1, by - 22, bx + 1, by - 20), fill="#ffd283")
         save(beacon, "phone_beacon")
-    elif name != "station":
+    elif name not in ("station", "weather", "cyber"):
         bx, by = a[0] + 4, a[1] + 6
         chimney = 20 if name == "warehouse" else 11
         d.polygon([(bx - 3, by - chimney), (bx + 3, by - chimney - 1), (bx + 3, by), (bx, by + 2), (bx - 3, by)], fill="#5b3c45", outline=INK)
@@ -177,8 +178,89 @@ def building(name, walls, roof, width, height, apex, number):
         else:
             edge = (x + width + 5, y + 7)
             d.line((x + 4, y + sy + 1, *edge), fill="#ac7762", width=2)
+    if name == "cyber":
+        cyber_roof_sign(d, a)
+    elif name in ("mail", "weather", "shop", "books"):
+        landmark_details(name, d, glow, width, height)
+    if editable:
+        for layer, shapes, colors in (
+            ("walls", wall_shapes, (*walls, "#4b353d")),
+            ("roof", ([a, b, el, nl], [wl, a, b, sl]), roof),
+        ):
+            mask, brush = canvas(img.size)
+            for polygon in shapes:
+                brush.polygon(polygon, fill="white")
+            allowed = {Image.new("RGB", (1, 1), color).getpixel((0, 0)) for color in colors}
+            art_pixels, mask_pixels = img.load(), mask.load()
+            for py in range(img.height):
+                for px in range(img.width):
+                    if art_pixels[px, py][:3] not in allowed:
+                        mask_pixels[px, py] = (0, 0, 0, 0)
+            save(mask, f"{name}_{layer}")
     save(img, name)
     save(lit, name + "_lit")
+
+
+def cyber_roof_sign(draw, ridge):
+    neon, light = canvas((72, 80))
+
+    def panel(x, y):
+        return ridge[0] - 5 + x, ridge[1] - 20 + y + x // 2
+
+    corners = [panel(0, 0), panel(31, 0), panel(31, 12), panel(0, 12)]
+    for x in (7, 23):
+        draw.line([panel(x, 10), panel(x, 19)], fill="#171624", width=3)
+        draw.line([panel(x, 12), panel(x, 19)], fill="#6c5167")
+    draw.polygon(corners, fill="#241b33", outline="#77516d")
+    light.polygon([panel(-1, -1), panel(32, -1), panel(32, 13), panel(-1, 13)],
+                  fill=(246, 109, 214, 72))
+    light.polygon(corners, fill="#392245", outline="#f9a5df", width=2)
+    controller = [panel(x, y) for x, y in ((8, 3), (22, 3), (25, 9), (21, 9), (18, 7),
+                                         (13, 7), (10, 9), (6, 9), (8, 3))]
+    draw.line(controller, fill="#594264")
+    light.line(controller, fill="#86ecff", width=2)
+    light.line([panel(10, 5), panel(14, 5)], fill="#e9f7ff", width=2)
+    light.line([panel(12, 4), panel(12, 7)], fill="#e9f7ff", width=2)
+    light.line([panel(19, 5), panel(21, 5)], fill="#ffe0f5", width=2)
+    save(neon, "cyber_neon")
+
+
+def landmark_details(name, d, glow, width, height):
+    extra, layer = canvas((72, 80))
+    y = 66 + width // 2 - height + 4
+    end = 36 + width - 3
+    sign = [(39, y), (end, y - (end - 39) // 2), (end, y + 6 - (end - 39) // 2), (39, y + 6)]
+    palettes = {
+        "mail": ("#592d40", "#dfa681", "#ffcf96"),
+        "weather": ("#284754", "#6ca2ae", "#acd5cf"),
+        "shop": ("#3c3e5c", "#a09ccd", "#d5cbff"),
+        "books": ("#494751", "#b59467", "#f0bd7c"),
+    }
+    dark, border, highlight = palettes[name]
+    d.polygon(sign, fill=dark, outline=border)
+    glow.polygon(sign, fill=dark, outline=highlight)
+    for x in range(42, end - 1, 3):
+        glow.line((x, y + 2 - (x - 39) // 2, x, y + 4 - (x - 39) // 2), fill=highlight)
+    if name == "mail":
+        d.rectangle((18, 59, 24, 67), fill="#462935", outline=INK)
+        d.line((19, 60, 23, 60), fill="#d69a81")
+        d.line((20, 64, 23, 64), fill="#f2b0a1")
+        layer.line((25, 63, 25, 53), fill="#d08275", width=2)
+        layer.rectangle((25, 53, 30, 56), fill="#e46979", outline="#ffb594")
+        save(extra, "mail_flag")
+    elif name == "weather":
+        d.line((37, 29, 37, 17), fill="#a79b9b")
+        d.ellipse((31, 32, 44, 40), fill="#345368", outline="#819799")
+        d.line((35, 34, 40, 32), fill="#a3cac2")
+    elif name == "shop":
+        d.polygon([(16, 57), (23, 60), (23, 67), (16, 64)], fill="#997455", outline=INK)
+        d.line((19, 59, 19, 65), fill="#c19a6f")
+    elif name == "books":
+        for x in range(16, 27, 2):
+            d.line((x, 57 + (x - 16) // 2, x, 62 + (x - 16) // 2), fill=palettes["books"][x % 3])
+        layer.polygon([(22, 53), (27, 55), (27, 61), (22, 59)], fill="#ffe1a4")
+        layer.line((23, 56, 26, 57), fill="#85654f")
+        save(extra, "books_note")
 
 
 def tree(index):
@@ -190,9 +272,31 @@ def tree(index):
     d.line([(35, 65), (37, 57), (35, 50)], fill="#895359")
     palettes = (
         ("#21192d", "#3f2444", "#593055", "#74395e", "#904665", "#ae637c"),
-        ("#181e31", "#2a2d47", "#3d3656", "#514069", "#644a73", "#81567d"),
-        ("#251b2b", "#4c263e", "#67334f", "#843a60", "#a4526c", "#b9677a"),
+        ("#182930", "#2a424b", "#3b555b", "#4b6767", "#64917c", "#92ab9c"),
+        ("#322231", "#543237", "#6e423e", "#945849", "#b77550", "#c5875e"),
     )
+    if index == 1:
+        d.line([(35, 66), (37, 53), (34, 44)], fill="#b6a4a3", width=3)
+        for py in (56, 60, 64):
+            d.point((36, py), fill="#422e3a")
+    if index >= 3:
+        if index == 5:
+            for branch in ([(36, 67), (36, 36), (31, 26)], [(36, 50), (46, 38), (47, 32)],
+                           [(36, 54), (27, 45), (25, 36)], [(38, 47), (43, 29)]):
+                d.line(branch, fill="#493340", width=3)
+                d.line(branch, fill="#986655")
+        else:
+            profile = [(37, 24), (21, 56), (47, 59), (53, 54)] if index == 3 else [(36, 17), (20, 61), (48, 65), (52, 61)]
+            d.polygon(profile, fill="#22434a" if index == 3 else "#283c4c", outline="#192a39")
+            for yy in range(32, 60, 5):
+                radius = (yy - 21) // 3
+                d.line((36 - radius, yy, 35, yy + 4), fill="#3e6870")
+                d.line((35, yy + 4, 33 + radius, yy + 2), fill="#305159")
+            for _ in range(44):
+                yy = rng.randrange(32, 60)
+                d.point((rng.randrange(36 - (yy - 24) // 4, 37 + (yy - 24) // 4), yy), fill="#42656c")
+        save(img, f"tree{index}")
+        return
     colors = palettes[index]
     for cx, cy, r in ((26, 47, 12), (47, 46, 12), (35, 43, 17), (18, 40, 10), (50, 37, 12),
                        (31, 29, 12), (41, 30, 13), (32, 39, 13)):
@@ -291,6 +395,19 @@ def props():
         save(img, name)
 
 
+def umbrellas():
+    for step, name in enumerate(("umbrella", "umbrella_step")):
+        img, d = canvas((72, 80))
+        d.line((35, 61, 33 + step * 4, 68), fill="#73566e")
+        d.line((38, 61, 40 - step * 5, 67), fill="#514661")
+        d.rectangle((34, 56, 39, 62), fill="#705467", outline=INK)
+        d.line((38, 51, 38, 61), fill="#a27e79")
+        d.polygon([(26, 53), (30, 48), (38, 45), (44, 48), (48, 53), (40, 54), (33, 53)], fill="#795274", outline=INK)
+        d.line([(30, 51), (38, 46), (43, 50)], fill="#cc849b")
+        d.point((38, 44), fill="#efd2b8")
+        save(img, name)
+
+
 def arrows():
     for suffix, points in (("down", ((1, 3), (4, 6), (7, 3))), ("up", ((1, 6), (4, 3), (7, 6)))):
         img, d = canvas((9, 9))
@@ -329,16 +446,25 @@ def icon():
 if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
     terrain()
-    for index in range(3):
+    for index in range(6):
         tree(index)
     building("house0", ("#5c404b", "#75505a", "#523c4b"), ("#38364f", "#51435c", "#63516a"), 18, 21, 10, 1)
     building("house1", ("#533e50", "#695261", "#4c384c"), ("#34384e", "#49435a", "#615369"), 17, 27, 12, 12)
     building("house2", ("#5d454d", "#80585a", "#583c49"), ("#3c3246", "#543c53", "#6d4b65"), 17, 17, 9, 41)
-    building("cafe", ("#693f4b", "#935753", "#6b4351"), ("#493953", "#65475e", "#8a5b72"), 21, 23, 12, 9)
+    building("cafe", ("#693f4b", "#935753", "#6b4351"), ("#493953", "#65475e", "#8a5b72"), 21, 23, 12, 9, True)
+    for name, walls, roof, width, height, apex, seed in (
+        ("mail", ("#6b4a53", "#87575c", "#593a48"), ("#492f48", "#654251", "#805569"), 17, 19, 10, 161),
+        ("weather", ("#3e5661", "#516c74", "#354653"), ("#394861", "#4b6272", "#5e777f"), 16, 24, 8, 162),
+        ("shop", ("#59536a", "#76607a", "#484054"), ("#3a3b56", "#545373", "#665d80"), 20, 23, 8, 163),
+        ("books", ("#594a52", "#775c56", "#483b47"), ("#354951", "#526469", "#6f7775"), 18, 21, 13, 164),
+        ("cyber", ("#4f4664", "#6c5374", "#3d324e"), ("#352e53", "#4c426f", "#635583"), 21, 24, 6, 165),
+    ):
+        building(name, walls, roof, width, height, apex, seed, True)
     building("phone", ("#504155", "#675260", "#4c3f51"), ("#30384d", "#464a65", "#595972"), 19, 26, 10, 4)
     building("warehouse", ("#68434a", "#865346", "#633c40"), ("#463145", "#664454", "#87565f"), 22, 23, 10, 7)
     building("station", ("#655054", "#83564e", "#6a4851"), ("#303f55", "#405268", "#5a6278"), 22, 22, 12, 8)
     props()
+    umbrellas()
     arrows()
     shore_stones()
     icon()
