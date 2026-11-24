@@ -25,6 +25,8 @@ is_visible = api(user32, "IsWindowVisible", wt.BOOL, wt.HWND)
 is_minimized = api(user32, "IsIconic", wt.BOOL, wt.HWND)
 window_pid = api(user32, "GetWindowThreadProcessId", wt.DWORD, wt.HWND, ct.POINTER(wt.DWORD))
 key_state = api(user32, "GetAsyncKeyState", ct.c_short, ct.c_int)
+window_at_point = api(user32, "WindowFromPoint", wt.HWND, wt.POINT)
+is_child = api(user32, "IsChild", wt.BOOL, wt.HWND, wt.HWND)
 tick_count = api(kernel32, "GetTickCount", wt.DWORD)
 drive_type = api(kernel32, "GetDriveTypeW", wt.UINT, wt.LPCWSTR)
 drive_bits = api(kernel32, "GetLogicalDrives", wt.DWORD)
@@ -57,6 +59,44 @@ def idle_seconds():
 
 def escape_pressed():
     return bool(key_state(0x1B) & 0x8000)
+
+
+WH_MOUSE_LL = 14
+WM_LBUTTONDOWN = 0x0201
+MOUSE_BUTTON_DOWN = {WM_LBUTTONDOWN, 0x0204, 0x0207, 0x020B}
+MouseHookProc = ct.WINFUNCTYPE(ct.c_ssize_t, ct.c_int, wt.WPARAM, wt.LPARAM)
+set_mouse_hook = api(user32, "SetWindowsHookExW", wt.HANDLE, ct.c_int, MouseHookProc, wt.HMODULE, wt.DWORD)
+remove_mouse_hook = api(user32, "UnhookWindowsHookEx", wt.BOOL, wt.HANDLE)
+next_mouse_hook = api(user32, "CallNextHookEx", ct.c_ssize_t, wt.HANDLE, ct.c_int, wt.WPARAM, wt.LPARAM)
+module_handle = api(kernel32, "GetModuleHandleW", wt.HMODULE, wt.LPCWSTR)
+
+
+class MousePressMonitor:
+    def __init__(self):
+        self.hook = None
+        self.callback = MouseHookProc(self.on_mouse)
+        self.presses = []
+
+    def start(self):
+        if not self.hook:
+            self.hook = set_mouse_hook(WH_MOUSE_LL, self.callback, module_handle(None), 0)
+
+    def stop(self):
+        if self.hook:
+            remove_mouse_hook(self.hook)
+            self.hook = None
+        self.presses.clear()
+
+    def take_presses(self):
+        presses, self.presses = self.presses, []
+        return presses
+
+    def on_mouse(self, code, message, data):
+        if code == 0 and message in MOUSE_BUTTON_DOWN:
+            # The first field of MSLLHOOKSTRUCT is the native screen position.
+            point = ct.cast(data, ct.POINTER(wt.POINT)).contents
+            self.presses.append((window_at_point(point), message == WM_LBUTTONDOWN))
+        return next_mouse_hook(None, code, message, data)
 
 
 def mounted_drives():
