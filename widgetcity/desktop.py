@@ -238,6 +238,7 @@ class DesktopCity:
         self.card_key = None
         self.player_allowed = True
         self.card_open = False
+        self.mail_viewed = False
         self.moving = False
         self.card_level = 0.
         self.transition = None
@@ -405,13 +406,21 @@ class DesktopCity:
             self.transition = None
             self.card_level = 0.
             self.bounce = None
-            if self.card_key:
-                self.cards[self.card_key].hide()
-            self.card_key = None
             self.timer.stop()
+            self.finish_card_close()
         elif self.card_key:
             self.transition = (monotonic(), self.card_level, 0.)
             self.timer.start()
+
+    def finish_card_close(self):
+        key = self.card_key
+        viewed = self.mail_viewed
+        self.card_key = None
+        self.mail_viewed = False
+        if key:
+            self.cards[key].hide()
+        if key == "mail" and viewed:
+            self.services.dismiss_seen_mail()
 
     def tick_player(self):
         now = monotonic()
@@ -422,16 +431,14 @@ class DesktopCity:
             if now >= start:
                 self.card_level = origin + (goal - origin) * ease((now - start) / .20)
                 if self.card_level > 0.01 and self.card_key:
-                    previously_visible = self.cards[self.card_key].isVisible()
                     self.place_card()
-                    if not previously_visible and self.card_key == "mail":
+                    if self.card_open and self.card_key == "mail" and self.cards["mail"].isVisible():
+                        self.mail_viewed = True
                         self.services.mark_mail_seen()
-                elif self.card_key:
-                    self.cards[self.card_key].hide()
                 if now - start >= .20:
                     self.transition = None
                     if not self.card_open:
-                        self.card_key = None
+                        self.finish_card_close()
         if self.bounce is not None:
             self.view.update()
             if now - self.bounce >= .25:

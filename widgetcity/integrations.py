@@ -42,17 +42,26 @@ async def read_notifications(sources):
     listener = Listener.current
     status = listener.get_access_status().name.lower()
     if status != "allowed":
-        return status, {}, []
+        return status, {}, [], None
     notifications = await asyncio.wait_for(listener.get_notifications_async(NotificationKinds.TOAST), 6)
-    known, entries = {}, []
+    status = listener.get_access_status().name.lower()
+    if status != "allowed":
+        return status, {}, [], None
+    known, entries, current_keys = {}, [], set()
+    complete = True
     allowed = {mail_source_key(source) for source in sources}
     for notification in notifications:
         try:
             info = notification.app_info
             source = info.app_user_model_id
-        except (OSError, AttributeError):
-            continue
-        if not source:
+            if not source:
+                complete = False
+                continue
+            stamp = notification.creation_time
+            key = f"{source}:{notification.id}:{stamp.isoformat()}"
+            current_keys.add(key)
+        except (OSError, ValueError, AttributeError):
+            complete = False
             continue
         display = source
         with suppress(OSError, AttributeError):
@@ -61,11 +70,9 @@ async def read_notifications(sources):
         item = {"id": source, "app": display}
         if selected_source(item, allowed):
             with suppress(OSError, ValueError, AttributeError):
-                stamp = notification.creation_time
-                item.update(key=f"{source}:{notification.id}:{stamp.isoformat()}",
-                            time=stamp.timestamp(), text=notification_text(notification), seen=False)
+                item.update(key=key, time=stamp.timestamp(), text=notification_text(notification), seen=False)
                 entries.append(item)
-    return status, known, entries
+    return status, known, entries, current_keys if complete else None
 
 
 def notifications(sources):
@@ -74,7 +81,7 @@ def notifications(sources):
     try:
         return asyncio.run(read_notifications(sources))
     except (OSError, RuntimeError, ImportError, TimeoutError):
-        return "unavailable", {}, []
+        return "unavailable", {}, [], None
     finally:
         if initialized:
             combase.RoUninitialize()
@@ -93,10 +100,10 @@ def clipboard_text(mime):
     return text[:4000] if text.strip() else ""
 
 
-def read_json(path, default):
+def read_json(path, default, *legacy_types):
     with suppress(OSError, ValueError):
         data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, type(default)):
+        if isinstance(data, (type(default), *legacy_types)):
             return data
     return default
 
@@ -129,8 +136,15 @@ class Integrations(QObject):
         self.pin_notes = [text[:4000] for text in read_json(self.notes_file, [])[:100] if isinstance(text, str)]
         self.recent = []
         self.writing_clip = False
-        self.mail_entries = [entry for entry in read_json(self.mail_file, [])[:40] if isinstance(entry, dict)
+        mail = read_json(self.mail_file, {}, list)
+        if isinstance(mail, list):
+            mail = {"entries": mail}
+        entries, dismissed = mail.get("entries"), mail.get("dismissed")
+        self.mail_dismissed = {key for key in dismissed if isinstance(key, str)} if isinstance(dismissed, list) else set()
+        self.mail_entries = [entry for entry in (entries[:40] if isinstance(entries, list) else [])
+                             if isinstance(entry, dict)
                              and all(isinstance(entry.get(key), str) for key in ("id", "app", "key", "text"))
+                             and entry["key"] not in self.mail_dismissed
                              and isinstance(entry.get("time"), (int, float))]
         self.mail_status = "unspecified"
         self.mail_sources = {}
@@ -164,6 +178,9 @@ class Integrations(QObject):
             save_json(path, value)
         except OSError:
             logging.exception("Could not save %s", path.name)
+
+    def save_mail(self):
+        self.save(self.mail_file, {"entries": self.mail_entries, "dismissed": sorted(self.mail_dismissed)})
 
     def configure(self):
         city = self.options["weather_city"].strip()
@@ -236,7 +253,7 @@ class Integrations(QObject):
         if not self.options["mail_sources"]:
             return "Выберите источники во вкладке «Активности»"
         if self.mail_status == "allowed" and self.enabled("mail"):
-            return "От выбранных приложений пока нет уведомлений Windows. Проверьте центр уведомлений (Win+N)."
+            return "Новых уведомлений пока нет. Почта получает их из центра уведомлений Windows (Win+N)."
         return "Доступ можно проверить во вкладке «Активности» → «Почта»."
 
     def request_notifications(self):
@@ -266,26 +283,38 @@ class Integrations(QObject):
         data = [item for item in self.mail_entries if selected_source(item, allowed)]
         if data != self.mail_entries:
             self.mail_entries = data
-            self.save(self.mail_file, data)
+            self.save_mail()
 
-    def merge_mail(self, status, sources, entries):
+    def merge_mail(self, status, sources, entries, current_keys=None):
         self.mail_status = status if status in MAIL_STATUS else "unavailable"
         self.mail_sources.update(sources)
         existing = {item["key"]: item for item in self.mail_entries}
         allowed = {mail_source_key(source) for source in self.options["mail_sources"]}
         for item in entries:
-            if selected_source(item, allowed):
+            if item["key"] not in self.mail_dismissed and selected_source(item, allowed):
                 existing.setdefault(item["key"], item)
         data = sorted(existing.values(), key=lambda item: item["time"], reverse=True)[:40]
-        if data != self.mail_entries:
+        dismissed = self.mail_dismissed
+        if status == "allowed" and current_keys is not None:
+            dismissed = dismissed & current_keys
+        if data != self.mail_entries or dismissed != self.mail_dismissed:
             self.mail_entries = data
-            self.save(self.mail_file, data)
+            self.mail_dismissed = dismissed
+            self.save_mail()
 
     def mark_mail_seen(self):
         if any(not item.get("seen") for item in self.mail_entries):
             for item in self.mail_entries:
                 item["seen"] = True
-            self.save(self.mail_file, self.mail_entries)
+            self.save_mail()
+            self.changed.emit()
+
+    def dismiss_seen_mail(self):
+        seen = {item["key"] for item in self.mail_entries if item.get("seen")}
+        if seen:
+            self.mail_entries = [item for item in self.mail_entries if item["key"] not in seen]
+            self.mail_dismissed.update(seen)
+            self.save_mail()
             self.changed.emit()
 
     def current_weather(self):

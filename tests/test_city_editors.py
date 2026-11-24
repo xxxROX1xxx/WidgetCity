@@ -116,12 +116,43 @@ class IntegrationTest(TestCase):
         item = {"id": "test-first", "app": "First", "time": 20., "key": "1", "text": "hello", "seen": False}
         other = dict(item, id="test-second", app="Second", key="2")
         self.services.merge_mail("allowed", {}, [item, other])
-        self.assertEqual(read_json(self.services.mail_file, []), [item])
+        self.assertEqual(read_json(self.services.mail_file, {})["entries"], [item])
         self.services.mark_mail_seen()
-        self.assertTrue(read_json(self.services.mail_file, [])[0]["seen"])
+        self.assertTrue(read_json(self.services.mail_file, {})["entries"][0]["seen"])
         prefs["mail_sources"] = []
         self.services.prune_mail()
-        self.assertEqual(read_json(self.services.mail_file, []), [])
+        self.assertEqual(read_json(self.services.mail_file, {})["entries"], [])
+
+    def test_dismissed_mail_does_not_return_after_poll_or_restart(self):
+        item = {"id": "Telegram", "app": "Telegram", "time": 20., "key": "old", "text": "First", "seen": False}
+        new = dict(item, time=21., key="new", text="Later")
+        self.services.merge_mail("allowed", {}, [item], {"old"})
+        self.services.mark_mail_seen()
+        self.assertEqual(len(self.services.mail_entries), 1)
+        self.services.merge_mail("allowed", {}, [new], {"old", "new"})
+        self.services.dismiss_seen_mail()
+        self.assertEqual(read_json(self.services.mail_file, {}), {"entries": [new], "dismissed": ["old"]})
+
+        self.services.merge_mail("allowed", {}, [item, new], {"old", "new"})
+        self.assertEqual(self.services.mail_entries, [new])
+        with patch.object(Integrations, "tick"):
+            restarted = Integrations(self.config, self.clipboard)
+        self.addCleanup(restarted.close)
+        restarted.merge_mail("denied", {}, [])
+        restarted.merge_mail("allowed", {}, [item, new], {"old", "new"})
+        self.assertEqual(restarted.mail_entries, [new])
+        restarted.merge_mail("allowed", {}, [new], {"new"})
+        self.assertEqual(read_json(restarted.mail_file, {})["dismissed"], [])
+
+    def test_old_mail_file_is_loaded(self):
+        item = {"id": "Discord", "app": "Discord", "time": 20., "key": "old", "text": "First", "seen": True}
+        save_json(self.services.mail_file, [item])
+        with patch.object(Integrations, "tick"):
+            restarted = Integrations(self.config, self.clipboard)
+        self.addCleanup(restarted.close)
+        self.assertEqual(restarted.mail_entries, [item])
+        restarted.dismiss_seen_mail()
+        self.assertEqual(read_json(restarted.mail_file, {}), {"entries": [], "dismissed": ["old"]})
 
     def test_default_sources_match_windows_names_and_ids(self):
         telegram = {"id": "Telegram.TelegramDesktop", "app": "Telegram Desktop",
@@ -151,7 +182,9 @@ class IntegrationTest(TestCase):
             display_info=SimpleNamespace(display_name="Discord PTB"),
         ))
         type(discord).notification = PropertyMock(side_effect=OSError)
-        unrelated = Mock(app_info=SimpleNamespace(app_user_model_id="other", display_info=None))
+        unrelated = Mock(id=3, creation_time=stamp, app_info=SimpleNamespace(
+            app_user_model_id="other", display_info=None,
+        ))
         unrelated_content = PropertyMock(side_effect=AssertionError("Unselected notification was read"))
         type(unrelated).notification = unrelated_content
         listener = SimpleNamespace(current=SimpleNamespace(
@@ -159,10 +192,12 @@ class IntegrationTest(TestCase):
             get_notifications_async=AsyncMock(return_value=[telegram, discord, unrelated]),
         ))
         with patch("winrt.windows.ui.notifications.management.UserNotificationListener", listener):
-            self.services.merge_mail(*asyncio.run(read_notifications(("Telegram", "Discord"))))
+            snapshot = asyncio.run(read_notifications(("Telegram", "Discord")))
+        self.assertIn(f"other:3:{stamp.isoformat()}", snapshot[3])
+        self.services.merge_mail(*snapshot)
         unrelated_content.assert_not_called()
         self.assertEqual([entry["text"] for entry in self.services.mail_entries], ["Тест", ""])
-        self.assertEqual(len(read_json(self.services.mail_file, [])), 2)
+        self.assertEqual(len(read_json(self.services.mail_file, {})["entries"]), 2)
 
     def test_clipboard_requires_opt_in_and_pins_are_separate(self):
         self.clipboard.setText("before consent")
