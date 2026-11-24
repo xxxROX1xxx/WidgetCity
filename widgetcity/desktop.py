@@ -1,13 +1,17 @@
+from functools import lru_cache
 from math import ceil, floor
 from time import monotonic
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QBitmap, QCursor, QFont, QFontMetrics, QImage, QPainter, QPixmap, QRegion
-from PySide6.QtWidgets import QApplication, QPushButton, QWidget
+from PySide6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
 
+from .cards import ActivityContent
+from .catalog import BUILDINGS
 from .city import ease, sprite
 from .media import MediaState, source_label
 from .shell import KEY_COLOR, ShellLayer, is_window, logical_rect
+from .steam import open_steam
 from .windows import escape_pressed
 
 FLOATING = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
@@ -42,33 +46,60 @@ class Surface(QWidget):
             shell.place(self, rect, **style)
 
 
-class CafeTarget(Surface):
-    pressed = Signal()
+@lru_cache(maxsize=None)
+def sprite_runs(name):
+    art = sprite(name)
+    runs = []
+    for y in range(art.height()):
+        run = None
+        for x in range(art.width() + 1):
+            solid = x < art.width() and art.pixelColor(x, y).alpha() >= 128
+            if solid and run is None:
+                run = x
+            if not solid and run is not None:
+                runs.append((run, x, y))
+                run = None
+    return tuple(runs)
 
-    def __init__(self):
+
+@lru_cache(maxsize=160)
+def sprite_region(name, scale):
+    region = QRegion()
+    for start, end, y in sprite_runs(name):
+        left, right = floor(start * scale), ceil(end * scale)
+        top, bottom = floor(y * scale), ceil((y + 1) * scale)
+        region |= QRegion(left, top, right - left, bottom - top)
+    return region
+
+
+class BuildingTarget(Surface):
+    pressed = Signal(str)
+
+    def __init__(self, key):
         super().__init__()
+        self.key = key
+        self.setAccessibleName(BUILDINGS[key])
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def place(self, desktop):
         layout = desktop.view.renderer.layout
         scale = desktop.scale
-        point = layout.point(*layout.landmarks["cafe"])
+        u, v = layout.landmarks[self.key]
+        point = layout.point(u, v)
         origin = point - QPoint(36, 66)
         base = desktop.rect.topLeft() + QPoint(floor(origin.x() * scale), floor(origin.y() * scale))
-        art = sprite("cafe")
+        art = sprite(self.key)
         bounds = QRect(base, QSize(ceil(art.width() * scale), ceil(art.height() * scale)))
-        region = QRegion()
-        for y in range(art.height()):
-            run = None
-            for x in range(art.width() + 1):
-                solid = x < art.width() and art.pixelColor(x, y).alpha() >= 128
-                if solid and run is None:
-                    run = x
-                if not solid and run is not None:
-                    left, right = floor(run * scale), ceil(x * scale)
-                    top, bottom = floor(y * scale), ceil((y + 1) * scale)
-                    region |= QRegion(left, top, right - left, bottom - top)
-                    run = None
+        region = QRegion(sprite_region(self.key, scale))
+        for prop in layout.props:
+            if (prop.u + prop.v, prop.u) <= (u + v, u):
+                continue
+            delta = layout.point(prop.u, prop.v) - point
+            if abs(delta.x()) >= art.width() or delta.y() >= art.height():
+                continue
+            relative = QPoint(floor((origin.x() + delta.x()) * scale) - floor(origin.x() * scale),
+                              floor((origin.y() + delta.y()) * scale) - floor(origin.y() * scale))
+            region -= sprite_region(prop.art, scale).translated(relative)
         screen = QApplication.screenAt(bounds.center()) or QApplication.primaryScreen()
         for native_rect in desktop.icon_rectangles:
             icon = logical_rect(native_rect, screen)
@@ -87,7 +118,7 @@ class CafeTarget(Surface):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.pressed.emit()
+            self.pressed.emit(self.key)
             event.accept()
 
 
@@ -176,18 +207,42 @@ class Player(Surface):
         painter.drawText(x, y + metrics.ascent(), metrics.elidedText(value, Qt.TextElideMode.ElideRight, 204))
 
 
+class ActivityCard(Surface):
+    SIZE = QSize(350, 260)
+
+    def __init__(self, key, services):
+        super().__init__()
+        self.setWindowTitle(BUILDINGS[key])
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(13, 12, 13, 12)
+        layout.addWidget(ActivityContent(key, services))
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), KEY_COLOR)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor("#674557"))
+        painter.setBrush(QColor("#211a29"))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 13, 13)
+
+
 class DesktopCity:
-    def __init__(self, renderer, scenes, position, scale):
+    def __init__(self, renderer, scenes, position, scale, services):
         self.view = CityView(renderer, scenes, self)
-        self.target = CafeTarget()
+        self.services = services
+        self.targets = {key: BuildingTarget(key) for key in BUILDINGS}
+        for target in self.targets.values():
+            target.pressed.connect(self.click_building)
         self.player = Player()
-        self.target.pressed.connect(self.click_cafe)
+        self.cards = {"cafe": self.player}
+        self.card_key = None
         self.player_allowed = True
         self.card_open = False
         self.moving = False
         self.card_level = 0.
         self.transition = None
         self.bounce = None
+        self.bounce_key = "cafe"
         self.position = position
         self.percent = scale
         self.scale = 1.
@@ -199,6 +254,8 @@ class DesktopCity:
         self.shell_timer.timeout.connect(self.refresh_shell)
         self.timer = QTimer(self.view, interval=16, timerType=Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.tick_player)
+        self.steam_timer = QTimer(self.view, interval=150, singleShot=True)
+        self.steam_timer.timeout.connect(open_steam)
         self.open_changed = lambda _opened: None
         self.place()
 
@@ -233,7 +290,7 @@ class DesktopCity:
 
     def refresh_shell(self):
         shell = self.shell if self.shell.valid() else ShellLayer.discover()
-        icon_rectangles = shell.icon_rects() if self.player_allowed else []
+        icon_rectangles = shell.icon_rects()
         changed = self.shell != shell
         icons_changed = self.icon_rectangles != icon_rectangles
         self.shell, self.icon_rectangles = shell, icon_rectangles
@@ -248,15 +305,25 @@ class DesktopCity:
                           opacity=220 if self.moving else 255, passthrough=not self.moving)
 
     def sync_target(self):
-        should_show = self.visible and self.shell.interactive and self.player_allowed and not self.moving
+        should_show = self.visible and self.shell.interactive and not self.moving
         if should_show:
-            self.target.place(self)
-            if self.player.isVisible():
-                self.place_player()
+            layout = self.view.renderer.layout
+            for key in sorted(self.targets, key=lambda name: (sum(layout.landmarks[name]), layout.landmarks[name][0])):
+                target = self.targets[key]
+                if key == "cafe" and not self.player_allowed:
+                    target.hide()
+                else:
+                    target.place(self)
+            if self.card_key and self.cards[self.card_key].isVisible():
+                self.place_card()
         else:
-            self.target.hide()
-            if not self.shell.interactive and (self.card_open or self.player.isVisible()):
+            self.hide_targets()
+            if not self.shell.interactive and self.card_key:
                 self.close_card(immediate=True)
+
+    def hide_targets(self):
+        for target in self.targets.values():
+            target.hide()
 
     def show(self, visible):
         self.visible = visible
@@ -268,12 +335,12 @@ class DesktopCity:
         else:
             self.shell_timer.stop()
             self.close_card(immediate=True)
-            self.target.hide()
+            self.hide_targets()
             self.view.hide()
 
     def allow_player(self, enabled):
         self.player_allowed = enabled
-        if not enabled:
+        if not enabled and self.card_key == "cafe":
             self.close_card(immediate=True)
         if self.visible:
             self.refresh_shell()
@@ -282,7 +349,7 @@ class DesktopCity:
     def move_mode(self, enabled):
         self.moving = enabled
         self.close_card(immediate=True)
-        self.target.hide()
+        self.hide_targets()
         self.view.drag = None
         self.view.setCursor(Qt.CursorShape.SizeAllCursor if enabled else Qt.CursorShape.ArrowCursor)
         self.place()
@@ -295,42 +362,54 @@ class DesktopCity:
         self.rect.moveTopLeft(global_point)
         self.place_view()
 
-    def place_player(self):
-        p = self.view.renderer.layout.roof
+    def place_card(self):
+        card = self.cards[self.card_key]
+        p = self.view.renderer.layout.roof_at(self.card_key)
         anchor = self.rect.topLeft() + QPoint(round(p.x() * self.scale), round(p.y() * self.scale))
         screen = QApplication.screenAt(anchor) or self.view.screen()
         bounds = screen.availableGeometry()
-        y = anchor.y() - self.player.height() - 10
+        size = card.SIZE.boundedTo(bounds.size() - QSize(18, 18))
+        y = anchor.y() - size.height() - 10
         if y < bounds.top() + 9:
             y = anchor.y() + 48
-        point = QPoint(anchor.x() - self.player.width() // 2, y + round(8 * (1 - self.card_level)))
-        rect = QRect(fit_position(point, self.player.SIZE, bounds), self.player.SIZE)
-        self.player.display(self.shell, rect, interactive=True, opacity=round(self.card_level * 255))
+        point = QPoint(anchor.x() - size.width() // 2, y + round(8 * (1 - self.card_level)))
+        rect = QRect(fit_position(point, size, bounds), size)
+        card.display(self.shell, rect, interactive=True, opacity=round(self.card_level * 255))
 
-    def click_cafe(self):
+    def click_building(self, key):
         now = monotonic()
-        # Restart a single hop on every click. The target and roof anchor stay fixed.
-        self.bounce = now
-        if self.card_open:
+        if key == "cyber":
+            self.close_card(immediate=True)
+            self.steam_timer.start()
+        elif self.card_open and self.card_key == key:
             self.close_card()
         else:
+            if self.card_key != key:
+                self.close_card(immediate=True)
+                if key not in self.cards:
+                    self.cards[key] = ActivityCard(key, self.services)
+                self.card_key = key
             self.card_open = True
-            self.open_changed(True)
+            if key == "cafe":
+                self.open_changed(True)
             self.transition = (now + .115, self.card_level, 1.)
-            self.timer.start()
+        self.bounce, self.bounce_key = now, key
+        self.timer.start()
         self.view.update()
 
     def close_card(self, immediate=False):
-        if self.card_open:
+        if self.card_open and self.card_key == "cafe":
             self.open_changed(False)
         self.card_open = False
         if immediate:
             self.transition = None
             self.card_level = 0.
             self.bounce = None
-            self.player.hide()
+            if self.card_key:
+                self.cards[self.card_key].hide()
+            self.card_key = None
             self.timer.stop()
-        else:
+        elif self.card_key:
             self.transition = (monotonic(), self.card_level, 0.)
             self.timer.start()
 
@@ -342,12 +421,17 @@ class DesktopCity:
             start, origin, goal = self.transition
             if now >= start:
                 self.card_level = origin + (goal - origin) * ease((now - start) / .20)
-                if self.card_level > 0.01:
-                    self.place_player()
-                else:
-                    self.player.hide()
+                if self.card_level > 0.01 and self.card_key:
+                    previously_visible = self.cards[self.card_key].isVisible()
+                    self.place_card()
+                    if not previously_visible and self.card_key == "mail":
+                        self.services.mark_mail_seen()
+                elif self.card_key:
+                    self.cards[self.card_key].hide()
                 if now - start >= .20:
                     self.transition = None
+                    if not self.card_open:
+                        self.card_key = None
         if self.bounce is not None:
             self.view.update()
             if now - self.bounce >= .25:
@@ -378,7 +462,8 @@ class CityView(Surface):
         frame = QImage(self.renderer.size, QImage.Format.Format_ARGB32_Premultiplied)
         frame.fill(Qt.GlobalColor.transparent)
         canvas = QPainter(frame)
-        self.renderer.paint(canvas, self.scenes, monotonic(), self.desktop.bounce, self.desktop.scale)
+        self.renderer.paint(canvas, self.scenes, monotonic(), self.desktop.bounce,
+                            self.desktop.scale, self.desktop.bounce_key)
         canvas.end()
         image = QPixmap.fromImage(frame.convertToFormat(QImage.Format.Format_RGB32))
         image.setMask(QBitmap.fromImage(frame.createAlphaMask(Qt.ImageConversionFlag.OrderedAlphaDither)))

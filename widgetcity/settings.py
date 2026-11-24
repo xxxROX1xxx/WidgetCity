@@ -2,8 +2,8 @@ import ntpath
 from random import SystemRandom
 from time import monotonic
 
-from PySide6.QtCore import QDir, QEvent, Qt, Signal
-from PySide6.QtGui import QColor, QLinearGradient, QPainter
+from PySide6.QtCore import QDir, QEvent, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QLinearGradient, QPainter
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -12,8 +12,10 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from .city import SPRITES
-from .config import MAX_SEED, SCENES, SIZES, default_folder, valid_rule
+from .config import MAX_SEED, SCENES, SIZES, default_folder, game_exe, mail_source_key, valid_rule
+from .editors import BuildingEditor, TreeEditor
 from .media import source_label
+from .steam import DOWNLOAD_STATUS
 
 QDir.addSearchPath("cityart", str(SPRITES))
 
@@ -29,6 +31,9 @@ QLabel#subtitle, QLabel#muted { color: #ac9bb3; }
 QLabel#small { color: #af9bb2; font-size: 11px; }
 QLabel#accent { color: #e7a37c; font-size: 11px; font-weight: 700; }
 QLabel#bindingLabel { color: #e9cad7; font-weight: 600; }
+QProgressBar { background: #2a2233; color: #f4dbe4; border: 1px solid #49374e; border-radius: 5px;
+    min-height: 18px; text-align: center; }
+QProgressBar::chunk { background: #835169; border-radius: 4px; }
 QPushButton, QComboBox, QSpinBox, QLineEdit {
     background: #2a2233; color: #f2e1e9; border: 1px solid #49374e;
     padding: 6px 11px; border-radius: 7px; min-height: 21px;
@@ -185,9 +190,10 @@ class ProgramPicker(QDialog):
 
 
 class BindingDialog(QDialog):
-    def __init__(self, parent, monitor, original=None):
+    def __init__(self, parent, monitor, original=None, game_only=False):
         super().__init__(parent)
         self.monitor, self.result_rule = monitor, None
+        self.game_only = game_only
         self.setWindowTitle("Изменить привязку" if original else "Добавить привязку")
         self.setMinimumWidth(495)
         layout = QVBoxLayout(self)
@@ -196,7 +202,7 @@ class BindingDialog(QDialog):
         self.kind = QComboBox()
         for name in ("Программа", "Подключение флешки", "Загрузка файла в папку", "Бездействие"):
             self.kind.addItem(name)
-        layout.addWidget(label("Условие запуска", "section"))
+        layout.addWidget(label("Игра для киберклуба" if game_only else "Условие запуска", "section"))
         layout.addWidget(self.kind)
         self.stack = QStackedWidget()
         layout.addWidget(self.stack)
@@ -217,6 +223,10 @@ class BindingDialog(QDialog):
         self.when.addItem("Программа запущена", "running")
         self.when.addItem("Окно активно", "foreground")
         program_layout.addWidget(self.when)
+        if game_only:
+            self.kind.hide()
+            self.when.hide()
+            self.exe.setPlaceholderText("Имя или путь к исполняемому файлу игры")
         self.stack.addWidget(programs)
         self.stack.addWidget(label("Срабатывает при подключении USB-накопителя.", "muted", True))
         download = QWidget()
@@ -280,6 +290,9 @@ class BindingDialog(QDialog):
         if not valid_rule(binding):
             self.error.setText("Укажите имя или путь к файлу .exe." if index == 0 else "Укажите папку.")
             return
+        if self.game_only and not game_exe(binding["exe"]):
+            self.error.setText("Укажите исполняемый файл игры. Сам клиент Steam не включает неон.")
+            return
         self.result_rule = binding
         super().accept()
 
@@ -304,9 +317,9 @@ class Settings(QWidget):
     visibility_changed = Signal()
     update_requested = Signal()
 
-    def __init__(self, config, renderer, scenes, monitor):
+    def __init__(self, config, renderer, scenes, monitor, services):
         super().__init__()
-        self.config, self.monitor = config, monitor
+        self.config, self.monitor, self.services = config, monitor, services
         self.data = config.data
         self.setObjectName("settings")
         self.setWindowTitle("WidgetCity")
@@ -340,7 +353,7 @@ class Settings(QWidget):
         outer.addWidget(rule())
         nav = QHBoxLayout()
         group = QButtonGroup(self)
-        for index, text in enumerate(("Город", "Активности")):
+        for index, text in enumerate(("Город", "Активности", "Здания", "Деревья")):
             tab = button(text)
             tab.setObjectName("tab")
             tab.setCheckable(True)
@@ -352,6 +365,12 @@ class Settings(QWidget):
         self.pages = QStackedWidget()
         self.pages.addWidget(self.city_page(renderer, scenes))
         self.pages.addWidget(self.activities_page(renderer, scenes))
+        self.building_editor = BuildingEditor(scenes)
+        self.tree_editor = TreeEditor(self.data["appearance"])
+        self.building_editor.changed.connect(lambda: self.changed.emit("appearance"))
+        self.tree_editor.changed.connect(lambda: self.changed.emit("appearance"))
+        self.pages.addWidget(self.building_editor)
+        self.pages.addWidget(self.tree_editor)
         group.idClicked.connect(self.pages.setCurrentIndex)
         self.pages.currentChanged.connect(lambda _: self.visibility_changed.emit())
         outer.addWidget(self.pages, 1)
@@ -363,6 +382,8 @@ class Settings(QWidget):
         footer.addWidget(label(f"v{__version__}", "small"))
         outer.addLayout(footer)
         self.sync_status()
+        services.changed.connect(self.refresh_options)
+        self.refresh_options()
 
     def update_status(self, status=""):
         self.update_button.setText(status or "Обновить")
@@ -470,13 +491,17 @@ class Settings(QWidget):
         self.enabled.toggled.connect(self.toggle_scene)
         right.addWidget(self.enabled)
         right.addWidget(rule())
-        right.addWidget(label("Привязки", "bindingLabel"))
+        self.binding_controls = QWidget()
+        binds = QVBoxLayout(self.binding_controls)
+        binds.setContentsMargins(0, 0, 0, 0)
+        self.binding_heading = label("Привязки", "bindingLabel")
+        binds.addWidget(self.binding_heading)
         self.bindings = QListWidget()
         self.bindings.setAccessibleName("Привязки выбранной активности")
         self.bindings.setMinimumHeight(91)
         self.bindings.currentRowChanged.connect(self.binding_selection)
         self.bindings.itemDoubleClicked.connect(lambda _: self.edit_binding(True))
-        right.addWidget(self.bindings, 1)
+        binds.addWidget(self.bindings, 1)
         actions = QHBoxLayout()
         add = button("+ Добавить")
         add.clicked.connect(lambda: self.edit_binding(False))
@@ -487,7 +512,15 @@ class Settings(QWidget):
         for control in (add, self.edit, self.remove):
             actions.addWidget(control)
         actions.addStretch()
-        right.addLayout(actions)
+        binds.addLayout(actions)
+        right.addWidget(self.binding_controls, 1)
+        self.options = QStackedWidget()
+        self.options.addWidget(self.mail_options())
+        self.options.addWidget(self.weather_options())
+        self.options.addWidget(self.clip_options())
+        self.shop_status = label("", "muted", True)
+        self.options.addWidget(self.shop_status)
+        right.addWidget(self.options, 1)
         self.cafe_settings = QWidget()
         cafe = QVBoxLayout(self.cafe_settings)
         cafe.setContentsMargins(0, 0, 0, 0)
@@ -517,6 +550,158 @@ class Settings(QWidget):
         self.scene_list.setCurrentRow(0)
         return page
 
+    def mail_options(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.mail_access = label("", "muted", True)
+        layout.addWidget(self.mail_access)
+        layout.addWidget(label(
+            "Для почты нужны уведомления в центре Windows (Win+N). В Telegram включите «Использовать уведомления Windows». "
+            "В Discord включите уведомления рабочего стола и выйдите из режима «Не беспокоить».", "muted", True,
+        ))
+        actions = QHBoxLayout()
+        access = button("Запросить доступ")
+        access.clicked.connect(self.services.request_notifications)
+        actions.addWidget(access)
+        system = button("Уведомления Windows")
+        system.clicked.connect(self.open_notification_settings)
+        actions.addWidget(system)
+        actions.addStretch()
+        layout.addLayout(actions)
+        layout.addWidget(label("Источники уведомлений", "bindingLabel"))
+        self.mail_list = QListWidget()
+        self.mail_list.setMinimumHeight(65)
+        layout.addWidget(self.mail_list, 1)
+        row = QHBoxLayout()
+        self.mail_choice = QComboBox()
+        self.mail_choice.setEditable(True)
+        self.mail_choice.lineEdit().setPlaceholderText("Выберите источник или введите имя приложения")
+        self.mail_choice.lineEdit().setMaxLength(256)
+        self.mail_choice.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        row.addWidget(self.mail_choice, 1)
+        add, remove = button("Добавить"), button("Удалить")
+        add.clicked.connect(self.add_mail_source)
+        remove.clicked.connect(self.remove_mail_source)
+        self.mail_choice.lineEdit().returnPressed.connect(self.add_mail_source)
+        row.addWidget(add)
+        row.addWidget(remove)
+        layout.addLayout(row)
+        self.known_mail = {}
+        self.listed_mail = None
+        return page
+
+    def open_notification_settings(self):
+        page = "privacy-notifications" if self.services.mail_status == "denied" else "notifications"
+        QDesktopServices.openUrl(QUrl(f"ms-settings:{page}"))
+
+    def add_mail_source(self):
+        text = self.mail_choice.currentText().strip()
+        index = self.mail_choice.currentIndex()
+        if index >= 0 and self.mail_choice.itemText(index) == text:
+            text = self.mail_choice.currentData() or text
+        sources = self.data["integrations"]["mail_sources"]
+        if text and len(sources) < 50 and all(mail_source_key(text) != mail_source_key(item) for item in sources):
+            sources.append(text)
+            self.mail_choice.setEditText("")
+            self.changed.emit("integrations")
+
+    def remove_mail_source(self):
+        row = self.mail_list.currentRow()
+        sources = self.data["integrations"]["mail_sources"]
+        if 0 <= row < len(sources):
+            sources.pop(row)
+            self.changed.emit("integrations")
+
+    def weather_options(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(label("Город для прогноза", "bindingLabel"))
+        self.weather_city = QLineEdit(self.data["integrations"]["weather_city"])
+        self.weather_city.setMaxLength(120)
+        self.weather_city.setPlaceholderText("Например, Казань или Париж, Франция")
+        apply = button("Сохранить")
+        row = QHBoxLayout()
+        row.addWidget(self.weather_city, 1)
+        row.addWidget(apply)
+        layout.addLayout(row)
+        self.weather_status = label("", "muted", True)
+        layout.addWidget(self.weather_status)
+        layout.addStretch()
+        apply.clicked.connect(self.set_weather_city)
+        self.weather_city.returnPressed.connect(self.set_weather_city)
+        return page
+
+    def set_weather_city(self):
+        city = self.weather_city.text().strip()
+        if city != self.data["integrations"]["weather_city"]:
+            self.data["integrations"]["weather_city"] = city
+            self.changed.emit("integrations")
+        else:
+            self.services.refresh_weather()
+
+    def clip_options(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        enabled = QCheckBox("Запоминать скопированный текст в WidgetCity")
+        enabled.setChecked(self.data["integrations"]["clipboard_enabled"])
+        enabled.toggled.connect(lambda value: self.set_clip_option("clipboard_enabled", value))
+        layout.addWidget(enabled)
+        self.clip_status = label("", "muted", True)
+        layout.addWidget(self.clip_status)
+        limit = QSpinBox(minimum=5, maximum=100, value=self.data["integrations"]["clipboard_limit"])
+        limit.valueChanged.connect(lambda value: self.set_clip_option("clipboard_limit", value))
+        row = QFormLayout()
+        row.addRow("Максимум фрагментов", limit)
+        layout.addLayout(row)
+        actions = QHBoxLayout()
+        clear = button("Очистить недавние")
+        clear.clicked.connect(self.services.clear_history)
+        actions.addWidget(clear)
+        actions.addStretch()
+        layout.addLayout(actions)
+        layout.addStretch()
+        return page
+
+    def set_clip_option(self, key, value):
+        self.data["integrations"][key] = value
+        self.changed.emit("integrations")
+
+    def refresh_options(self):
+        service = self.services
+        self.mail_access.setText(service.mail_message)
+        if service.mail_sources != self.known_mail:
+            self.known_mail = service.mail_sources.copy()
+            text = self.mail_choice.currentText()
+            self.mail_choice.clear()
+            for key, caption in sorted(self.known_mail.items(), key=lambda item: item[1].casefold()):
+                self.mail_choice.addItem(caption or key, key)
+            self.mail_choice.setEditText(text)
+        sources = [(key, self.known_mail.get(key, key)) for key in service.options["mail_sources"]]
+        if sources != self.listed_mail:
+            self.listed_mail = sources
+            self.mail_list.clear()
+            for key, caption in sources:
+                item = QListWidgetItem(caption)
+                item.setToolTip(key)
+                self.mail_list.addItem(item)
+        weather = service.current_weather()
+        city = service.options["weather_city"]
+        self.weather_status.setText(service.weather_error or weather.get("place") or (
+            "Ожидаем прогноз" if city else "Введите название города."
+        ))
+        if not service.options["clipboard_enabled"]:
+            state = "История WidgetCity выключена."
+        elif not service.enabled("books"):
+            state = "Активность книжной лавки выключена."
+        else:
+            state = f"История WidgetCity включена · {len(service.recent)} фрагментов"
+        self.clip_status.setText(state)
+        steam = service.steam
+        self.shop_status.setText(DOWNLOAD_STATUS[steam.status] + (f"\n{steam.name}" if steam.name else ""))
+
     def scene_key(self):
         return self.scene_list.currentItem().data(Qt.ItemDataRole.UserRole)
 
@@ -530,6 +715,12 @@ class Settings(QWidget):
         self.enabled.blockSignals(False)
         self.try_scene.setEnabled(self.enabled.isChecked())
         self.cafe_settings.setVisible(key == "cafe")
+        pages = {"mail": 0, "weather": 1, "books": 2, "shop": 3}
+        self.options.setVisible(key in pages)
+        if key in pages:
+            self.options.setCurrentIndex(pages[key])
+        self.binding_controls.setVisible(key not in pages)
+        self.binding_heading.setText("Игры" if key == "cyber" else "Привязки")
         self.load_bindings()
 
     def load_bindings(self, selection=0):
@@ -541,7 +732,8 @@ class Settings(QWidget):
         if self.bindings.count():
             self.bindings.setCurrentRow(min(selection, self.bindings.count() - 1))
         else:
-            item = QListWidgetItem("Нет привязок")
+            item = QListWidgetItem("Игры из библиотек Steam обнаруживаются автоматически"
+                                   if self.scene_key() == "cyber" else "Нет привязок")
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.bindings.addItem(item)
         self.binding_selection()
@@ -557,7 +749,7 @@ class Settings(QWidget):
         row = self.bindings.currentRow()
         if edit and not 0 <= row < len(bindings):
             return
-        dialog = BindingDialog(self, self.monitor, bindings[row] if edit else None)
+        dialog = BindingDialog(self, self.monitor, bindings[row] if edit else None, game_only=key == "cyber")
         if dialog.exec() == QDialog.DialogCode.Accepted:
             if edit:
                 bindings[row] = dialog.result_rule

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from functools import lru_cache
-from math import pi, sin
+from math import ceil, cos, pi, radians, sin
 from pathlib import Path
 from random import Random
 from time import monotonic
@@ -8,16 +8,49 @@ from time import monotonic
 from PySide6.QtCore import QPoint, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPolygon, QRegion
 
+from .catalog import BUILDINGS, ROOF_HEIGHT, TREES
+
 SPRITES = Path(__file__).with_name("sprites")
 SIZES = {"small": (8, 5), "medium": (11, 7), "large": (14, 9)}
-TEST_LENGTH = {"cafe": 6.0, "phone": 6.0, "warehouse": 8.0, "night": 12.0}
+TEST_LENGTH = {"cafe": 6., "phone": 6., "warehouse": 8., "night": 12.,
+               "mail": 8., "weather": 12., "shop": 9., "books": 8., "cyber": 8.}
 TRAIN_TRAVEL = 3.
 BOX_TRIP = 2.8
+SHOP_TRAVEL = 2.6
 
 
 @lru_cache(maxsize=None)
 def sprite(name):
     return QImage(str(SPRITES / f"{name}.png"))
+
+
+@lru_cache(maxsize=72)
+def material_sprite(name, walls="", roof=""):
+    original = sprite(name)
+    if not (walls or roof):
+        return original
+    result = original.copy()
+    for part, color in (("walls", walls), ("roof", roof)):
+        if not color:
+            continue
+        mask = sprite(f"{name}_{part}")
+        target = QColor(color)
+        pixels = []
+        for y in range(mask.height()):
+            for x in range(mask.width()):
+                if mask.pixelColor(x, y).alpha():
+                    source = original.pixelColor(x, y)
+                    value = .2126 * source.red() + .7152 * source.green() + .0722 * source.blue()
+                    pixels.append((x, y, value, source.alpha()))
+        if pixels:
+            center = sum(pixel[2] for pixel in pixels) / len(pixels)
+            for x, y, value, alpha in pixels:
+                factor = value / max(1, center)
+                gleam = max(0., (value - center) * .18)
+                channels = [min(255, round(component * factor + gleam))
+                            for component in (target.red(), target.green(), target.blue())]
+                result.setPixelColor(x, y, QColor(*channels, alpha))
+    return result
 
 
 @dataclass(frozen=True)
@@ -36,7 +69,7 @@ class Prop:
 
 
 class Layout:
-    def __init__(self, seed, size):
+    def __init__(self, seed, size, trees=TREES):
         self.seed, self.size = seed, size
         self.wide, self.deep = SIZES[size]
         rng = Random(seed)
@@ -49,6 +82,7 @@ class Layout:
         columns = set(range(rng.randrange(2, 4), self.wide - 1, 3))
         self.tiles = []
         self.props = []
+        self.tree_lots = []
 
         station = (rng.randrange(2, self.wide - 2), self.deep - 2)
         storefronts = [
@@ -66,13 +100,20 @@ class Layout:
         storefronts.remove(cafe)
         phone = rng.choice(storefronts)
         self.landmarks = {"cafe": cafe, "phone": phone, "warehouse": freight, "station": station}
+        locations = [(u, v) for v in range(self.deep - 2) for u in range(self.wide)
+                     if u not in columns and v not in rows and (u, v) not in self.landmarks.values()]
+        placement = Random(seed ^ 0x6A4B9)
+        placement.shuffle(locations)
+        locations.sort(key=lambda p: p[1] + 1 not in rows and p[0] + 1 not in columns)
+        additions = dict(zip(locations, (key for key in BUILDINGS if key != "cafe")))
+        self.landmarks.update({key: lot for lot, key in additions.items()})
         landmarks = {p: name for name, p in self.landmarks.items()}
         for v in range(self.deep):
             for u in range(self.wide):
                 name = landmarks.get((u, v))
                 if v == self.deep - 1:
                     kind = "rail"
-                elif name:
+                elif name and (u, v) not in additions:
                     kind = "stone"
                     self.props.append(Prop(u, v, name, .27 if name == "cafe" else .68))
                 elif v in rows or u in columns:
@@ -87,7 +128,8 @@ class Layout:
                     kind = rng.choice(("grass", "stone", "stone"))
                     value = rng.random()
                     if value < .24:
-                        self.props.append(Prop(u, v, f"tree{rng.randrange(3)}"))
+                        rng.randrange(3)  # Preserve the layout RNG sequence used by existing seeds.
+                        self.tree_lots.append((u, v))
                     elif value < .87:
                         self.props.append(Prop(u, v, f"house{rng.randrange(3)}", rng.uniform(.29, .94)))
                     else:
@@ -96,6 +138,20 @@ class Layout:
         for u in range(1, self.wide, 3):
             self.props.append(Prop(u + .34, self.deep - .49, "lamp"))
             self.props.append(Prop(u + .73, self.deep - .41, "shrubs"))
+        self.tree_lots = [lot for lot in self.tree_lots if lot not in additions]
+        self.fixed_props = [p for p in self.props if (int(p.u + .5), int(p.v + .5)) not in additions]
+        self.fixed_props.extend(Prop(*lot, art, .6) for lot, art in additions.items())
+        self.set_trees(trees)
+
+    def set_trees(self, enabled):
+        allowed = set(enabled) & TREES.keys()
+        plants = Random(self.seed ^ 0x728B1)
+        self.props = self.fixed_props.copy()
+        if allowed:
+            for u, v in self.tree_lots:
+                priority = plants.sample(list(TREES), len(TREES))
+                species = next(key for key in priority if key in allowed)
+                self.props.append(Prop(u, v, TREES[species][1]))
         self.props.sort(key=lambda p: (p.u + p.v, p.u))
 
     def point(self, u, v):
@@ -106,7 +162,10 @@ class Layout:
 
     @property
     def roof(self):
-        return self.point(*self.landmarks["cafe"]) + QPoint(1, -37)
+        return self.roof_at("cafe")
+
+    def roof_at(self, key):
+        return self.point(*self.landmarks[key]) + QPoint(1, -ROOF_HEIGHT[key])
 
 def ease(t):
     t = min(1., max(0., t))
@@ -138,6 +197,23 @@ class StationDelivery:
         return now < max(self.loading_end, self.departure + TRAIN_TRAVEL)
 
 
+@dataclass
+class ShopDelivery:
+    arrival: float
+    departure: float | None = None
+
+    @property
+    def loading_start(self):
+        return self.arrival + SHOP_TRAVEL
+
+    def finish_loading(self, now):
+        trips = ceil(max(0., now - self.loading_start) / BOX_TRIP)
+        self.departure = self.loading_start + trips * BOX_TRIP
+
+    def active(self, now):
+        return self.departure is None or now < self.departure + SHOP_TRAVEL
+
+
 class Scenes:
     def __init__(self):
         self.enabled = {}
@@ -145,10 +221,18 @@ class Scenes:
         self.events = {}
         self.tests = {}
         self.delivery = None
+        self.shop_delivery = None
         self.lighting_changed = monotonic()
         self.night = False
         self.night_from = 0.0
         self.music = False
+        self.external = set()
+        self.wind = None
+        self.colors = {}
+        self.clip_until = 0.
+        self.neon_target = False
+        self.neon_from = 0.
+        self.neon_changed = monotonic()
 
     def configure(self, activities):
         self.enabled = {key: entry["enabled"] for key, entry in activities.items()}
@@ -160,8 +244,13 @@ class Scenes:
         self.refresh_night()
         if not self.enabled.get("station"):
             self.delivery = None
+        if not self.enabled.get("shop"):
+            self.shop_delivery = None
         if not self.enabled.get("night"):
             self.night_from = 0.
+        if not self.enabled.get("cyber"):
+            self.neon_target = False
+            self.neon_from = 0.
 
     def refresh_night(self):
         now = monotonic()
@@ -178,7 +267,20 @@ class Scenes:
         return self.night_from + (float(self.night) - self.night_from) * elapsed
 
     def active(self, key, now):
-        return self.enabled.get(key, False) and (key in self.levels or now < self.tests.get(key, 0))
+        return self.enabled.get(key, False) and (
+            key in self.levels or key in self.external or now < self.tests.get(key, 0)
+        )
+
+    def refresh_neon(self, now):
+        target = self.active("cyber", now)
+        if target != self.neon_target:
+            self.neon_from = self.neon(now)
+            self.neon_target = target
+            self.neon_changed = now
+
+    def neon(self, now):
+        t = ease((now - self.neon_changed) / 1.25)
+        return self.neon_from + (float(self.neon_target) - self.neon_from) * t
 
     def test(self, key):
         if self.enabled.get(key):
@@ -196,6 +298,19 @@ class Scenes:
             self.delivery.add(now, boxes)
         else:
             self.delivery = StationDelivery.start(now, boxes)
+
+    def refresh_shop(self, now):
+        requested = self.active("shop", now)
+        delivery = self.shop_delivery
+        if delivery is not None and not delivery.active(now):
+            self.shop_delivery = delivery = None
+        if delivery is None:
+            if requested:
+                self.shop_delivery = ShopDelivery(now)
+        elif requested and delivery.departure is not None and now <= delivery.departure:
+            delivery.departure = None
+        elif not requested and delivery.departure is None:
+            delivery.finish_loading(now)
 
     def update_triggers(self, levels, events):
         now = monotonic()
@@ -216,11 +331,35 @@ class Scenes:
 
     def interval(self, now):
         if (0 <= now - self.events.get("warehouse", -100) < TEST_LENGTH["warehouse"]
-                or self.delivery is not None and self.delivery.active(now)):
+                or self.delivery is not None and self.delivery.active(now)
+                or self.shop_delivery is not None
+                or self.active("weather", now) or now - self.neon_changed < 1.25):
             return 33
         if self.night and now - self.events.get("night", -100) < 10:
             return 75
         return 200 if self.night else 90
+
+
+def paint_building_effects(painter, name, origin, scenes, now):
+    if name == "mail" and scenes.active(name, now):
+        painter.drawImage(origin, sprite("mail_flag"))
+    elif name == "books" and scenes.enabled.get(name) and (scenes.active(name, now) or now < scenes.clip_until):
+        painter.drawImage(origin, sprite("books_note"))
+    elif name == "cyber":
+        painter.setOpacity(scenes.neon(now))
+        painter.drawImage(origin, sprite("cyber_neon"))
+        painter.setOpacity(1.)
+    elif name == "weather" and scenes.enabled.get(name):
+        wind = scenes.wind
+        if now < scenes.tests.get(name, 0):
+            wind = now * 130 % 360
+        if wind is not None:
+            angle = radians(wind)
+            x, y = round(8 * (sin(angle) + cos(angle))), round(4 * (sin(angle) - cos(angle)))
+            hub = origin + QPoint(37, 17)
+            painter.setPen(QColor("#a5cacc"))
+            painter.drawLine(hub - QPoint(x, y), hub + QPoint(x, y))
+            painter.fillRect(hub.x() + x - 1, hub.y() + y - 1, 3, 3, QColor("#f1b074"))
 
 
 class Renderer:
@@ -276,7 +415,7 @@ class Renderer:
                 painter.fillRect(x, y, rng.randrange(1, 7), 1, QColor(color))
         painter.restore()
 
-    def paint(self, painter, scenes, now, bouncing_at=None, scale=1.0):
+    def paint(self, painter, scenes, now, bouncing_at=None, scale=1.0, bouncing_key="cafe"):
         layout = self.layout
         painter.drawImage(0, 0, self.ground)
         dim = scenes.dim(now)
@@ -286,14 +425,20 @@ class Renderer:
         hop = round(3.7 * sin(pi * pulse) / scale) if 0 <= pulse < 1 else 0
         if scenes.night:
             dim = min(1.0, dim)
+        if scenes.active("weather", now):
+            for i in range(1, layout.wide, 2):
+                pos = layout.point(i + .28, layout.main_street + .12)
+                painter.fillRect(pos.x() - 5, pos.y(), 10, 3, QColor(71, 125, 160, 150))
+                painter.fillRect(pos.x() - 2, pos.y() + (int(now * 6) + i) % 3, 5, 1, QColor("#8aa0af"))
         actors = self.actors(scenes, now)
         props = sorted((*layout.props, *actors), key=lambda p: (p.u + p.v, p.u)) if actors else layout.props
         for prop in props:
             point = layout.point(prop.u, prop.v)
             origin = point - QPoint(36, 66)
-            if prop.art == "cafe":
+            if prop.art == bouncing_key:
                 origin -= QPoint(0, hop)
-            painter.drawImage(origin, sprite(prop.art))
+            palette = scenes.colors.get(prop.art, {})
+            painter.drawImage(origin, material_sprite(prop.art, palette.get("walls", ""), palette.get("roof", "")))
             offset = (round(prop.u * 23 + prop.v * 17) % 11) / 50
             light = prop.light * (1 - .90 * ease((dim - offset) / .8))
             if prop.art == "cafe":
@@ -308,6 +453,8 @@ class Renderer:
                 self.notes(painter, origin, now)
             if prop.art == "warehouse" and not scenes.night:
                 self.smoke(painter, origin + QPoint(30, 25), now)
+            if prop.art in BUILDINGS:
+                paint_building_effects(painter, prop.art, origin, scenes, now)
         self.water_lights(painter, now, dim)
 
     @staticmethod
@@ -384,4 +531,24 @@ class Renderer:
         if scenes.night and 3 < elapsed < 10:
             result.append(Prop(.4 + (layout.wide - 1) * (elapsed - 3) / 7,
                                layout.main_street + .26 + .038 * sin(elapsed * 24), "cat_step" if step else "cat"))
+        if scenes.active("weather", now):
+            for delay in (0., 4.4):
+                phase = (now + delay) % 9. / 9.
+                result.append(Prop(.5 + phase * (layout.wide - 1.), layout.main_street + .20,
+                                   "umbrella" if step else "umbrella_step"))
+        shop = scenes.shop_delivery
+        if shop is not None and shop.active(now):
+            u, v = layout.landmarks["shop"]
+            path = 1. - ease((now - shop.arrival) / SHOP_TRAVEL)
+            if shop.departure is not None:
+                path += ease((now - shop.departure) / SHOP_TRAVEL)
+            result.append(Prop(u + min(1.4, layout.wide - u - .4) * path, v + .72, "van"))
+            if now >= shop.loading_start and (shop.departure is None or now < shop.departure):
+                phase = ((now - shop.loading_start) % BOX_TRIP) / BOX_TRIP
+                carrying = phase < .58
+                t = ease(phase / .58 if carrying else (1 - phase) / .42)
+                y = v + .74 - .71 * t
+                result.append(Prop(u + .26, y, worker))
+                if carrying:
+                    result.append(Prop(u + .39, y, "crate"))
         return result

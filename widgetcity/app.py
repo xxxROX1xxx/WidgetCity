@@ -10,6 +10,7 @@ from . import __version__
 from .city import Layout, Renderer, SPRITES, Scenes
 from .config import Config
 from .desktop import DesktopCity
+from .integrations import Integrations
 from .media import MediaMonitor, MediaState
 from .settings import STYLE, Settings
 from .update_ui import UpdateController
@@ -25,15 +26,17 @@ class Application:
     def __init__(self, app, config):
         self.app, self.config, self.data = app, config, config.data
         self.scenes = Scenes()
+        self.scenes.colors = self.data["appearance"]["colors"]
         self.renderer = self.build_city()
         self.triggers = TriggerMonitor()
         self.trigger_version = 0
         self.media = MediaMonitor(self.data["player"]["source"])
         self.media_state = MediaState()
         self.player_source = None
-        self.settings = Settings(config, self.renderer, self.scenes, self.triggers)
+        self.integrations = Integrations(config, app.clipboard(), app)
+        self.settings = Settings(config, self.renderer, self.scenes, self.triggers, self.integrations)
         self.updater = UpdateController(self.settings)
-        self.desktop = DesktopCity(self.renderer, self.scenes, self.data["position"], self.data["scale"])
+        self.desktop = DesktopCity(self.renderer, self.scenes, self.data["position"], self.data["scale"], self.integrations)
         self.desktop.open_changed = self.media.request_cover
         self.frames = QTimer(timerType=Qt.TimerType.CoarseTimer)
         self.frames.timeout.connect(self.frame)
@@ -50,6 +53,8 @@ class Application:
         self.triggers.updated.connect(self.apply_triggers)
         self.media.changed.connect(self.apply_media)
         self.media.sources_changed.connect(self.settings.source_options)
+        self.integrations.changed.connect(self.refresh_integrations)
+        self.integrations.clip_added.connect(self.show_clip_note)
 
         self.tray = QSystemTrayIcon(app.windowIcon())
         self.tray.setToolTip("WidgetCity")
@@ -73,6 +78,7 @@ class Application:
         self.triggers.start()
         self.media.start()
         self.apply_visibility()
+        self.refresh_integrations()
 
     def connect_screen(self, screen):
         screen.availableGeometryChanged.connect(self.reposition)
@@ -82,7 +88,7 @@ class Application:
         self.desktop.view.update()
 
     def build_city(self):
-        return Renderer(Layout(self.data["seed"], self.data["size"]))
+        return Renderer(Layout(self.data["seed"], self.data["size"], self.data["appearance"]["trees"]))
 
     def changed(self, key):
         if key in ("seed", "size"):
@@ -96,7 +102,14 @@ class Application:
             self.desktop.set_scale(self.data["scale"])
         elif key == "activities":
             self.configure_triggers()
+            self.integrations.configure()
             self.refresh_music()
+            self.frame()
+        elif key == "integrations":
+            self.integrations.configure()
+        elif key == "appearance":
+            self.renderer.layout.set_trees(self.data["appearance"]["trees"])
+            self.desktop.sync_target()
             self.frame()
         elif key == "visible":
             self.apply_visibility()
@@ -104,6 +117,31 @@ class Application:
             self.configure_player()
             self.frame()
         self.save_timer.start()
+
+    def refresh_integrations(self):
+        services = self.integrations
+        weather = services.current_weather()
+        external = set()
+        if any(not item.get("seen") for item in services.mail_entries):
+            external.add("mail")
+        if weather.get("raining"):
+            external.add("weather")
+        if services.steam.status == "downloading":
+            external.add("shop")
+        if services.steam.playing:
+            external.add("cyber")
+        self.scenes.wind = weather.get("wind")
+        self.scenes.external = external
+        if not services.history_enabled:
+            self.scenes.clip_until = 0.
+        self.frame()
+        if (self.desktop.card_open and self.desktop.card_key == "mail"
+                and self.desktop.cards["mail"].isVisible()):
+            services.mark_mail_seen()
+
+    def show_clip_note(self):
+        self.scenes.clip_until = monotonic() + 8.
+        self.frame()
 
     def configure_triggers(self):
         activities = self.config.activity_snapshot()
@@ -150,6 +188,8 @@ class Application:
     def frame(self):
         now = monotonic()
         self.scenes.refresh_night()
+        self.scenes.refresh_neon(now)
+        self.scenes.refresh_shop(now)
         visible_city = self.desktop.view.isVisible()
         if visible_city:
             self.desktop.view.update()
@@ -158,7 +198,10 @@ class Application:
             previews = tuple(p for p in (self.settings.preview, self.settings.scene_preview) if p.isVisible())
         for preview in previews:
             preview.update()
-        if visible_city or previews:
+        editor = self.settings.building_editor.isVisible() and not self.settings.isMinimized()
+        if editor:
+            self.settings.building_editor.repaint_previews()
+        if visible_city or previews or editor:
             interval = self.scenes.interval(now)
             if not self.frames.isActive() or self.frames.interval() != interval:
                 self.frames.start(interval)
@@ -215,6 +258,7 @@ class Application:
         self.tray.hide()
         self.triggers.stop()
         self.media.requestInterruption()
+        self.integrations.close()
         self.updater.stop()
         self.triggers.wait()
         self.media.wait()
