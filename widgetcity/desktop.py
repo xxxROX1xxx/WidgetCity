@@ -12,7 +12,7 @@ from .city import ease, sprite
 from .media import MediaState, source_label
 from .shell import KEY_COLOR, ShellLayer, is_window, logical_rect
 from .steam import open_steam
-from .windows import escape_pressed
+from .windows import MousePressMonitor, escape_pressed, is_child
 
 FLOATING = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowDoesNotAcceptFocus)
@@ -238,6 +238,7 @@ class DesktopCity:
         self.card_key = None
         self.player_allowed = True
         self.card_open = False
+        self.mouse_presses = MousePressMonitor()
         self.mail_viewed = False
         self.moving = False
         self.card_level = 0.
@@ -391,6 +392,7 @@ class DesktopCity:
                     self.cards[key] = ActivityCard(key, self.services)
                 self.card_key = key
             self.card_open = True
+            self.mouse_presses.start()
             if key == "cafe":
                 self.open_changed(True)
             self.transition = (now + .115, self.card_level, 1.)
@@ -402,6 +404,7 @@ class DesktopCity:
         if self.card_open and self.card_key == "cafe":
             self.open_changed(False)
         self.card_open = False
+        self.mouse_presses.stop()
         if immediate:
             self.transition = None
             self.card_level = 0.
@@ -422,9 +425,20 @@ class DesktopCity:
         if key == "mail" and viewed:
             self.services.dismiss_seen_mail()
 
+    def clicked_outside_card(self):
+        card = self.cards[self.card_key].hwnd
+        for window, left_button in self.mouse_presses.take_presses():
+            if card and window and (window == card or is_child(card, window)):
+                continue
+            # Buildings already handle their own left clicks to toggle or switch cards.
+            if left_button and window and any(target.hwnd == window for target in self.targets.values()):
+                continue
+            return True
+        return False
+
     def tick_player(self):
         now = monotonic()
-        if self.card_open and escape_pressed():
+        if self.card_open and (escape_pressed() or self.clicked_outside_card()):
             self.close_card()
         if self.transition is not None:
             start, origin, goal = self.transition
